@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from jax import vmap
 import equinox as eqx
-from typing import Optional, Union, Tuple
+from typing import Optional, Union
 from jaxtyping import Array, Float
 
 
@@ -18,12 +18,12 @@ class BSpline(eqx.Module):
     - Monotonicity constraints for training
     """
     
-    control_points: Float[Array, "n_control_points dim"] 
+    control_points: Float[Array, "n_control_points dim"]  # type: ignore
     degree: int = eqx.static_field()
     
     def __init__(
         self,
-        control_points: Float[Array, "n_control_points dim"],
+        control_points: Float[Array, "n_control_points dim"],  # type: ignore
         degree: int = 3,
         key: Optional[jax.random.PRNGKey] = None
     ):
@@ -54,7 +54,7 @@ class BSpline(eqx.Module):
         self.control_points = control_points
         self.degree = degree
     
-    def _compute_basis_functions(self, t: Float[Array, ""]) -> Float[Array, "n_control_points"]:
+    def _compute_basis_functions(self, t: Float[Array, ""]) -> Float[Array, "n_control_points"]:  # type: ignore
         """
         Compute all B-spline basis functions at parameter t.
         Assumes uniform knot spacing.
@@ -77,7 +77,7 @@ class BSpline(eqx.Module):
         
         return jax.lax.switch(degree_index, branches)
     
-    def _compute_cubic_basis(self, t: Float[Array, ""], n_control_points: int) -> Float[Array, "n_control_points"]:
+    def _compute_cubic_basis(self, t: Float[Array, ""], n_control_points: int) -> Float[Array, "n_control_points"]:  # type: ignore
         """Compute cubic B-spline basis functions with uniform knot spacing."""
         # Scale parameter to segment space
         t_scaled = t * (n_control_points - 3)
@@ -112,7 +112,7 @@ class BSpline(eqx.Module):
         
         return result
     
-    def _compute_quadratic_basis(self, t: Float[Array, ""], n_control_points: int) -> Float[Array, "n_control_points"]:
+    def _compute_quadratic_basis(self, t: Float[Array, ""], n_control_points: int) -> Float[Array, "n_control_points"]:  # type: ignore
         """Compute quadratic B-spline basis functions with uniform knot spacing."""
         t_scaled = t * (n_control_points - 2)
         segment = jnp.floor(t_scaled).astype(int)
@@ -138,7 +138,7 @@ class BSpline(eqx.Module):
         
         return result
     
-    def _compute_linear_basis(self, t: Float[Array, ""], n_control_points: int) -> Float[Array, "n_control_points"]:
+    def _compute_linear_basis(self, t: Float[Array, ""], n_control_points: int) -> Float[Array, "n_control_points"]:  # type: ignore
         """Compute linear B-spline basis functions with uniform knot spacing."""
         t_scaled = t * (n_control_points - 1)
         segment = jnp.floor(t_scaled).astype(int)
@@ -162,7 +162,7 @@ class BSpline(eqx.Module):
         
         return result
     
-    def __call__(self, t: Union[float, Float[Array, "..."]]) -> Float[Array, "... dim"]:
+    def __call__(self, t: Union[float, Float[Array, "..."]]) -> Float[Array, "... dim"]:  # type: ignore
         """
         Evaluate the B-spline at parameter value(s) t.
         
@@ -189,7 +189,7 @@ class BSpline(eqx.Module):
         # Reshape to match input shape + dimension
         return results.reshape(original_shape + (self.control_points.shape[1],))
     
-    def derivative(self, t: Union[float, Float[Array, "..."]], order: int = 1) -> Float[Array, "... dim"]:
+    def derivative(self, t: Union[float, Float[Array, "..."]], order: int = 1) -> Float[Array, "... dim"]:  # type: ignore
         """
         Compute the derivative of the B-spline at parameter value(s) t.
         Uses uniform knot spacing assumption for derivative computation.

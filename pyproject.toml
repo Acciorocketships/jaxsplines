@@ -59,4 +59,15 @@ line_length = 88
 [tool.pytest.ini_options]
 testpaths = ["tests", "examples"]
 python_files = ["test_*.py", "*_test.py"]
-addopts = "-v --tb=short" 
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+extend-ignore = ["F821", "F722"]  # Allow JAX typing forward references and syntax
+
+[tool.mypy]
+plugins = ["jaxtyping.mypy_plugin"]
+ignore_missing_imports = true
+disable_error_code = ["misc", "name-defined"] 
