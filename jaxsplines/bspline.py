@@ -165,6 +165,7 @@ class BSpline(eqx.Module):
     def __call__(self, t: Union[float, Float[Array, "..."]]) -> Float[Array, "... dim"]:  # type: ignore
         """
         Evaluate the B-spline at parameter value(s) t.
+        Supports extrapolation beyond [0,1] using linear extension.
         
         Args:
             t: Parameter value(s) where to evaluate the spline
@@ -177,11 +178,26 @@ class BSpline(eqx.Module):
         t_flat = t.ravel()
         
         def evaluate_single(t_val):
-            # Get basis function values
-            basis_values = self._compute_basis_functions(t_val)
+            # Handle extrapolation outside [0,1] using JAX conditionals
+            # Linear extrapolation to -∞ using derivative at t=0
+            point_0 = self._evaluate_clamped(0.0)
+            deriv_0 = self._derivative_clamped(0.0, order=1)
+            extrap_neg = point_0 + t_val * deriv_0
             
-            # Compute weighted sum of control points
-            return jnp.sum(basis_values[:, None] * self.control_points, axis=0)
+            # Linear extrapolation to +∞ using derivative at t=1  
+            point_1 = self._evaluate_clamped(1.0)
+            deriv_1 = self._derivative_clamped(1.0, order=1)
+            extrap_pos = point_1 + (t_val - 1.0) * deriv_1
+            
+            # Normal evaluation within [0,1]
+            normal_eval = self._evaluate_clamped(t_val)
+            
+            # Use JAX conditionals instead of Python if statements
+            return jnp.where(
+                t_val < 0,
+                extrap_neg,
+                jnp.where(t_val > 1, extrap_pos, normal_eval)
+            )
         
         # Vectorize over parameter values
         results = vmap(evaluate_single)(t_flat)
@@ -189,25 +205,26 @@ class BSpline(eqx.Module):
         # Reshape to match input shape + dimension
         return results.reshape(original_shape + (self.control_points.shape[1],))
     
-    def derivative(self, t: Union[float, Float[Array, "..."]], order: int = 1) -> Float[Array, "... dim"]:  # type: ignore
-        """
-        Compute the derivative of the B-spline at parameter value(s) t.
-        Uses uniform knot spacing assumption for derivative computation.
+    def _evaluate_clamped(self, t_val: float) -> jnp.ndarray:
+        """Evaluate B-spline within [0,1] domain (internal helper)."""
+        # Get basis function values
+        basis_values = self._compute_basis_functions(t_val)
         
-        Args:
-            t: Parameter value(s) where to evaluate the derivative
-            order: Order of the derivative (1 for first derivative, etc.)
-            
-        Returns:
-            Derivative vector(s) at the given parameter value(s)
-        """
+        # Compute weighted sum of control points
+        return jnp.sum(basis_values[:, None] * self.control_points, axis=0)
+    
+    def _evaluate_clamped_batch(self, t_vals: jnp.ndarray) -> jnp.ndarray:
+        """Evaluate B-spline at multiple points within [0,1] domain (internal helper)."""
+        return vmap(self._evaluate_clamped)(t_vals)
+    
+    def _derivative_clamped(self, t_val: float, order: int = 1) -> jnp.ndarray:
+        """Compute derivative within [0,1] domain (internal helper)."""
         if order <= 0:
-            return self(t)
+            return self._evaluate_clamped(t_val)
         
         if self.degree < order:
             # Derivative order higher than spline degree results in zero
-            t = jnp.asarray(t)
-            return jnp.zeros(t.shape + (self.control_points.shape[1],))
+            return jnp.zeros(self.control_points.shape[1])
         
         # Compute derivative control points using uniform knot spacing
         n_control_points = self.control_points.shape[0]
@@ -217,8 +234,6 @@ class BSpline(eqx.Module):
         for _ in range(order):
             new_control_points = []
             for i in range(n_control_points - 1):
-                # For uniform knots, the knot spacing is 1/(n_control_points - current_degree)
-                # So the coefficient is current_degree * (n_control_points - current_degree)
                 coeff = current_degree * (n_control_points - current_degree)
                 new_point = coeff * (derivative_control_points[i + 1] - derivative_control_points[i])
                 new_control_points.append(new_point)
@@ -227,13 +242,316 @@ class BSpline(eqx.Module):
             current_degree -= 1
             n_control_points -= 1
         
-        # Create derivative spline
+        # Create derivative spline and evaluate (clamped)
         derivative_spline = BSpline(
             control_points=derivative_control_points,
             degree=current_degree
         )
         
-        return derivative_spline(t)
+        return derivative_spline._evaluate_clamped(t_val)
+    
+    def derivative(self, t: Union[float, Float[Array, "..."]], order: int = 1) -> Float[Array, "... dim"]:  # type: ignore
+        """
+        Compute the derivative of the B-spline at parameter value(s) t.
+        For extrapolated regions (t < 0 or t > 1), returns the derivative at the boundary.
+        
+        Args:
+            t: Parameter value(s) where to evaluate the derivative
+            order: Order of the derivative (1 for first derivative, etc.)
+            
+        Returns:
+            Derivative vector(s) at the given parameter value(s)
+        """
+        t = jnp.asarray(t)
+        original_shape = t.shape
+        t_flat = t.ravel()
+        
+        def derivative_single(t_val):
+            # For extrapolated regions, use boundary derivatives
+            deriv_0 = self._derivative_clamped(0.0, order)
+            deriv_1 = self._derivative_clamped(1.0, order)
+            deriv_normal = self._derivative_clamped(t_val, order)
+            
+            # Use JAX conditionals
+            return jnp.where(
+                t_val < 0,
+                deriv_0,
+                jnp.where(t_val > 1, deriv_1, deriv_normal)
+            )
+        
+        # Vectorize over parameter values
+        results = vmap(derivative_single)(t_flat)
+        
+        # Reshape to match input shape + dimension
+        return results.reshape(original_shape + (self.control_points.shape[1],))
+    
+    def invert(self, target_value: float, dimension: int = 0, tolerance: float = 1e-12, 
+               assume_monotonic: bool = True) -> float:
+        """
+        Find the parameter t that gives the target_value in the specified dimension.
+        Uses analytical inversion via Cardano's formula for monotonic cubic B-splines.
+        
+        Args:
+            target_value: The desired output value to find t for
+            dimension: Which dimension to invert (0 for x, 1 for y, etc.)
+            tolerance: Numerical tolerance for degenerate cases
+            assume_monotonic: If True, skip monotonicity validation (use after project_to_monotonic)
+            
+        Returns:
+            Parameter value t such that spline(t)[dimension] ≈ target_value
+            
+        Raises:
+            ValueError: If spline is not cubic or fails monotonicity check
+        """
+        if self.degree != 3:
+            raise ValueError("Analytical inversion only implemented for cubic B-splines")
+        
+        # Rigorous monotonicity check unless explicitly disabled
+        if not assume_monotonic:
+            if not self.check_monotonic(dimension, tolerance):
+                raise ValueError(f"Spline is not monotonic in dimension {dimension}. "
+                               f"Use project_to_monotonic() first, or set assume_monotonic=True if you're sure.")
+        
+        # For monotonic splines, check if we need extrapolation
+        point_0 = self._evaluate_clamped(0.0)[dimension]
+        point_1 = self._evaluate_clamped(1.0)[dimension] 
+        
+        # Handle extrapolation cases
+        min_boundary = jnp.minimum(point_0, point_1)
+        max_boundary = jnp.maximum(point_0, point_1)
+        
+        if target_value < min_boundary:
+            # Extrapolate to negative t values
+            deriv_0 = self._derivative_clamped(0.0, order=1)[dimension]
+            if abs(deriv_0) < tolerance:
+                return 0.0  # Derivative too small, return boundary
+            t_extrap = (target_value - point_0) / deriv_0
+            return t_extrap
+        elif target_value > max_boundary:
+            # Extrapolate to t > 1 values  
+            deriv_1 = self._derivative_clamped(1.0, order=1)[dimension]
+            if abs(deriv_1) < tolerance:
+                return 1.0  # Derivative too small, return boundary
+            t_extrap = 1.0 + (target_value - point_1) / deriv_1
+            return t_extrap
+        
+        # Find which span contains the target value
+        n_control_points = self.control_points.shape[0]
+        n_spans = n_control_points - 3
+        
+        # Evaluate spline at span boundaries to find the right span
+        span_params = jnp.linspace(0, 1, n_spans + 1)
+        span_values = self(span_params)[:, dimension]
+        
+        # Find the span where target_value lies
+        span_idx = jnp.searchsorted(span_values[:-1], target_value, side='right') - 1
+        span_idx = jnp.clip(span_idx, 0, n_spans - 1)
+        
+        # Get the four control points for this span
+        control_points_span = self.control_points[span_idx:span_idx + 4, dimension]
+        
+        # Convert to local parameter and invert analytically
+        u_local = self._invert_span_analytic(target_value, control_points_span, tolerance)
+        
+        # Convert back to global parameter
+        t_global = (span_idx + u_local) / n_spans
+        
+        return jnp.clip(t_global, 0.0, 1.0)
+    
+    def check_monotonic(self, dimension: int = 0, epsilon: float = 1e-12) -> bool:
+        """
+        Check if the spline is monotonic in the specified dimension using the same
+        rigorous mathematical conditions as project_to_monotonic.
+        
+        Args:
+            dimension: Which dimension to check (0 for x, 1 for y, etc.)
+            epsilon: Tolerance for numerical precision
+            
+        Returns:
+            True if spline is monotonic in the specified dimension, False otherwise
+        """
+        if self.degree != 3:
+            # For non-cubic splines, fall back to simple control point check
+            control_values = self.control_points[:, dimension]
+            is_increasing = jnp.all(control_values[1:] >= control_values[:-1] - epsilon)
+            is_decreasing = jnp.all(control_values[1:] <= control_values[:-1] + epsilon)
+            return is_increasing or is_decreasing
+        
+        n_control_points = self.control_points.shape[0]
+        n_segments = n_control_points - 3
+        
+        if n_segments <= 0:
+            return True
+        
+        # Check each segment (span) for monotonicity conditions
+        for seg_idx in range(n_segments):
+            # Get the four control points for this segment
+            P = self.control_points[seg_idx:seg_idx + 4, dimension]
+            P0, P1, P2, P3 = P[0], P[1], P[2], P[3]
+            
+            # Basic ordering check: P₂ >= P₀ and P₃ >= P₁ (for increasing)
+            # or P₂ <= P₀ and P₃ <= P₁ (for decreasing)
+            increasing_basic = (P2 >= P0 - epsilon) and (P3 >= P1 - epsilon)
+            decreasing_basic = (P2 <= P0 + epsilon) and (P3 <= P1 + epsilon)
+            
+            if not (increasing_basic or decreasing_basic):
+                return False
+            
+            # Check discriminant condition for monotonicity:
+            # (P₀ - 2P₁ + P₂)² < (P₂ - P₀)(-P₀ + 3P₁ - 3P₂ + P₃)
+            lhs = (P0 - 2*P1 + P2)**2
+            rhs = (P2 - P0) * (-P0 + 3*P1 - 3*P2 + P3)
+            
+            if lhs >= rhs + epsilon:  # Fails discriminant condition
+                return False
+            
+            # Check vertex-outside conditions
+            if not self._check_vertex_outside_conditions(P0, P1, P2, P3, epsilon):
+                return False
+        
+        return True
+    
+    def _check_vertex_outside_conditions(self, P0: float, P1: float, P2: float, P3: float, epsilon: float) -> bool:
+        """
+        Check if the vertex of the cubic's derivative is outside [0,1] interval,
+        using the same conditions as the projection methods.
+        """
+        # The derivative of the cubic B-spline has a critical point.
+        # For monotonicity, this critical point should be outside [0,1].
+        
+        # Coefficients of the derivative (quadratic)
+        # Derivative: A'u² + B'u + C' where:
+        A_deriv = (-P0 + 3*P1 - 3*P2 + P3) / 2  # Coefficient of u²
+        B_deriv = (P0 - 2*P1 + P2)              # Coefficient of u
+        C_deriv = (P2 - P0) / 2                 # Constant term
+        
+        # For monotonicity, either:
+        # 1. No critical point (A_deriv ≈ 0), or
+        # 2. Critical point outside [0,1]
+        
+        if abs(A_deriv) < epsilon:
+            # Linear derivative - always monotonic if slope doesn't change sign
+            return True
+        
+        # Critical point at u_crit = -B_deriv / (2 * A_deriv)
+        u_crit = -B_deriv / (2 * A_deriv)
+        
+        # Check if critical point is outside [0,1]
+        outside_interval = (u_crit < -epsilon) or (u_crit > 1 + epsilon)
+        
+        if outside_interval:
+            return True
+        
+        # Alternative conditions from projection methods:
+        # Left of 0 case: P₀ ≥ 2P₁ - P₂
+        left_condition = P0 >= 2*P1 - P2 - epsilon
+        
+        # Right of 1 case: P₂ ≥ (P₃ + P₁) / 2  
+        right_condition = P2 >= (P3 + P1) / 2 - epsilon
+        
+        # Common condition: P₃ > P₀ - 3P₁ + 3P₂
+        common_condition = P3 > P0 - 3*P1 + 3*P2 - epsilon
+        
+        # Monotonic if any of the vertex-outside conditions are satisfied
+        return common_condition and (left_condition or right_condition)
+    
+    def _invert_span_analytic(self, y: float, P: jnp.ndarray, tolerance: float = 1e-12) -> float:
+        """
+        Analytically invert one cubic B-spline span using Cardano's formula.
+        
+        Args:
+            y: Target ordinate value
+            P: Array of 4 control point values [P0, P1, P2, P3] for this span
+            tolerance: Numerical tolerance for degenerate cases
+            
+        Returns:
+            Local parameter u in [0,1] such that the span evaluates to y
+        """
+        P0, P1, P2, P3 = P[0], P[1], P[2], P[3]
+        
+        # Convert B-spline basis to standard cubic form: A*u³ + B*u² + C*u + D
+        A = (-P0 + 3*P1 - 3*P2 + P3) / 6
+        B = (P0 - 2*P1 + P2) / 2
+        C = (P2 - P0) / 2
+        D = (P0 + 4*P1 + P2) / 6
+        F = D - y  # Constant term after moving y to left side
+        
+        # Handle degenerate cases
+        if jnp.abs(A) < tolerance:
+            # Quadratic or linear case
+            if jnp.abs(B) < tolerance:
+                # Linear case: C*u + F = 0
+                if jnp.abs(C) < tolerance:
+                    # Constant case - should not happen with proper input
+                    raise ValueError("Constant case - should not happen with proper input")
+                else:
+                    u = -F / C
+                    return jnp.clip(u, 0.0, 1.0)
+            else:
+                # Quadratic case: B*u² + C*u + F = 0
+                discriminant = C*C - 4*B*F
+                if discriminant < 0:
+                    raise ValueError("No real solution")
+                sqrt_disc = jnp.sqrt(discriminant)
+                u1 = (-C + sqrt_disc) / (2*B)
+                u2 = (-C - sqrt_disc) / (2*B)
+                
+                # Choose root in [0,1]
+                if 0 <= u1 <= 1:
+                    return u1
+                elif 0 <= u2 <= 1:
+                    return u2
+                else:
+                    return jnp.clip(u1, 0.0, 1.0)
+        
+        # Full cubic case - depress the cubic
+        # Transform to v³ + p*v + q = 0 with u = v - B/(3*A)
+        p = (3*A*C - B*B) / (3*A*A)
+        q = (2*B*B*B - 9*A*B*C + 27*A*A*F) / (27*A*A*A)
+        
+        # Cardano's formula
+        Delta = (q/2)**2 + (p/3)**3
+        
+        if Delta >= 0:
+            # One real root
+            sqrt_delta = jnp.sqrt(Delta)
+            
+            # Handle negative cube roots properly
+            term1 = -q/2 + sqrt_delta
+            term2 = -q/2 - sqrt_delta
+            
+            cbrt1 = jnp.sign(term1) * jnp.abs(term1)**(1/3)
+            cbrt2 = jnp.sign(term2) * jnp.abs(term2)**(1/3)
+            
+            v = cbrt1 + cbrt2
+            u = v - B/(3*A)
+            
+            return jnp.clip(u, 0.0, 1.0)
+        
+        else:
+            # Three real roots
+            r = 2 * jnp.sqrt(-p/3)
+            phi = jnp.arccos(-q/2 / jnp.sqrt(-(p/3)**3))
+            
+            # Compute all three roots
+            u0 = r * jnp.cos(phi/3) - B/(3*A)
+            u1 = r * jnp.cos((phi + 2*jnp.pi)/3) - B/(3*A)
+            u2 = r * jnp.cos((phi + 4*jnp.pi)/3) - B/(3*A)
+            
+            # Choose the root that lies in [0,1]
+            roots = jnp.array([u0, u1, u2])
+            valid_mask = (roots >= 0) & (roots <= 1)
+            
+            # If we have valid roots, choose the first one
+            # If no valid roots, clamp the closest one
+            if jnp.any(valid_mask):
+                valid_roots = jnp.where(valid_mask, roots, jnp.inf)
+                return jnp.min(valid_roots)
+            else:
+                # Choose the root closest to [0,1]
+                distances = jnp.minimum(jnp.abs(roots), jnp.abs(roots - 1))
+                closest_idx = jnp.argmin(distances)
+                return jnp.clip(roots[closest_idx], 0.0, 1.0)
     
     def project_to_monotonic(self, epsilon: float = 1e-6) -> 'BSpline':
         """
