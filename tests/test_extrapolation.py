@@ -62,7 +62,7 @@ def test_improved_inversion():
     spline = BSpline(control_points=control_points, degree=3)
     
     # Project to ensure monotonicity
-    mono_spline = spline.project_to_monotonic_simple()
+    mono_spline = spline.project_to_monotonic(method="simple")
     
     print("Testing inversion within bounds:")
     
